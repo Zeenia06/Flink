@@ -1,0 +1,246 @@
+
+
+INSERT INTO sales (window_start, window_end, id, category, total) 
+SELECT * FROM ( 
+SELECT window_start, window_end, p.id as product_id, p.category as product_category, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total  
+FROM TABLE ( 
+TUMBLE(TABLE product, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '-1' HOUR)) as pw 
+LEFT JOIN purchase pr ON pr.product_id = pw.id 
+LEFT JOIN product p ON p.id = pw.id 
+GROUP BY window_start, window_end, p.id, p.category) ORDER BY total DESC LIMIT 1; 
+
+
+--- Join 2 tables --- 
+SELECT p.id AS product_id, 
+p.category AS product_name 
+from product p JOIN 
+sales s ON s.id = p.id; 
+
+
+
+INSERT INTO top_product(created, product_id, category, price, quantity, discount)
+SELECT p.created, pr.product_id, p.category, p.price, pr.quantity, pr.discount
+FROM product p JOIN purchase pr ON p.id = pr.product_id; 
+
+ALTER TABLE `sales` ADD (`total` DOUBLE ); 
+
+INSERT INTO top_product(created, product_id, category, price,total) 
+SELECT p.created, pr.product_id, p.category, p.price,SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total 
+FROM product p JOIN purchase pr ON p.id = pr.product_id 
+GROUP BY p.created, pr.product_id, p.category, p.price; 
+
+
+CREATE TABLE sales ( 
+`window_start` TIMESTAMP(3), 
+`window_end` TIMESTAMP(3),
+`product_id` BIGINT, 
+`category` STRING, 
+`price` DOUBLE,
+`total` DOUBLE,
+PRIMARY KEY(product_id) NOT ENFORCED
+) WITH ( 
+'connector' = 'upsert-kafka', 
+'topic' = 'sales', 
+'properties.bootstrap.servers' = 'kafka-1:9092', 
+'properties.group.id' = 'consumer-sales-group',
+'properties.security.protocol' = 'SASL_PLAINTEXT',
+'properties.sasl.mechanism' = 'PLAIN',
+'properties.sasl.jaas.config' = 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret";',
+'key.format' = 'avro-confluent',
+'properties.allow.auto.create.topics' = 'false',
+'key.avro-confluent.schema-registry.url' = 'http://schema-registry:8085',
+'key.avro-confluent.schema-registry.subject' = 'top-sales-value',
+'value.format' = 'avro-confluent',
+'value.avro-confluent.schema-registry.url' = 'http://schema-registry:8085',
+'value.avro-confluent.schema-registry.subject' = 'top-sales-value',
+'properties.auto.offset.reset' = 'earliest'
+);
+
+
+INSERT INTO sales(created, product_id, category, price, total) 
+SELECT p.created, pr.product_id, p.category, p.price, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total
+FROM product p
+JOIN purchase pr ON pr.product_id = p.id
+GROUP BY p.created, pr.product_id, p.category, p.price;
+
+CREATE VIEW table_join AS 
+SELECT p.created, pr.product_id, p.category, p.price, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount, 0)/100))) AS total,
+COUNT(*) AS cnt  
+FROM product p JOIN purchase pr ON p.id = pr.product_id 
+GROUP BY p.created, pr.product_id, p.category, p.price;
+
+INSERT INTO sales 
+SELECT * FROM table_join; 
+
+SELECT * FROM ( 
+SELECT *, ROW_NUMBER() OVER (PARTITION BY window_start, window_end ORDER BY total DESC) as rownum  
+FROM ( 
+SELECT window_start, window_end, product_id, total
+FROM TABLE(HOP(TABLE sales, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '10' MINUTE)) 
+GROUP BY window_start, window_end, product_id, total ) 
+) where rownum = 1;
+
+ALTER TABLE `sales` ADD (`rn` BIGINT ); 
+
+--------------------
+
+INSERT INTO sales(window_start, window_end, product_id, category, price, total) 
+SELECT window_start, window_end, pr.product_id, p.category, p.price, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total
+FROM TABLE(HOP(TABLE purchase, DESCRIPTOR(ts), INTERVAL '5' MINUTE, INTERVAL '1' HOUR)) AS pw 
+JOIN purchase pr ON pr.product_id = pw.id 
+JOIN product p ON p.id = pw.id
+GROUP BY window_start, window_end, pr.product_id, p.category, p.price;
+
+SELECT * FROM ( 
+SELECT * , ROW_NUMBER() OVER (ORDER BY window_start ASC) AS rownum 
+FROM( 
+select * from sales group by window_start, window_end, product_id, category, price, total ORDER BY total DESC) 
+) where rownum = 1;
+
+
+-------------------------
+
+WITH total_sales AS ( 
+SELECT window_start, window_end, p.id, p.category, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total, 
+ROW_NUMBER() OVER(PARTITION BY window_start, window_end ORDER BY SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) DESC) AS rn 
+FROM TABLE ( 
+TUMBLE(TABLE product, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '-1' HOUR)) as pw 
+JOIN purchase pr ON pr.product_id = pw.id 
+JOIN product p ON p.id = pw.id 
+GROUP BY window_start, window_end, p.id, p.category )
+SELECT window_start, window_end, id, category, total 
+FROM total_sales WHERE rn = 1;
+
+
+CREATE TABLE top ( 
+`ts` TIMESTAMP(3), 
+`product_id` BIGINT, 
+`price` DOUBLE,
+`quantity` BIGINT, 
+`discount` DOUBLE, 
+`total` DOUBLE,
+PRIMARY KEY(product_id) NOT ENFORCED
+) WITH ( 
+'connector' = 'kafka', 
+'topic' = 'top1', 
+'properties.bootstrap.servers' = 'kafka-1:9092', 
+'properties.group.id' = 'consumer-product-group',
+'properties.security.protocol' = 'SASL_PLAINTEXT',
+'properties.sasl.mechanism' = 'PLAIN',
+'properties.sasl.jaas.config' = 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret";',
+'key.format' = 'avro-confluent',
+'properties.allow.auto.create.topics' = 'true',
+'key.avro-confluent.schema-registry.url' = 'http://schema-registry:8085',
+'key.avro-confluent.schema-registry.subject' = 'top-product-value',
+'value.format' = 'avro-confluent',
+'value.avro-confluent.schema-registry.url' = 'http://schema-registry:8085',
+'value.avro-confluent.schema-registry.subject' = 'top-product-value',
+'properties.auto.offset.reset' = 'earliest'
+);
+
+----------------------
+INSERT INTO top_product(ts, product_id, price, quantity, discount,total) 
+SELECT pr.ts, pr.product_id, p.price, pr.quantity, pr.discount,
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total
+FROM product p
+JOIN purchase pr ON pr.product_id = p.id
+GROUP BY pr.ts, pr.product_id, p.price, pr.quantity, pr.discount;
+
+
+SELECT * FROM ( 
+SELECT * , ROW_NUMBER() OVER (ORDER BY window_start DESC) AS rownum 
+FROM( 
+select * from sales group by window_start, window_end, product_id, category, price, total ORDER BY total DESC) 
+) where rownum = 1;
+---------------------
+
+CREATE VIEW top_performing_product AS 
+SELECT window_start, window_end, id, category, total FROM (
+SELECT window_start, window_end, id, category, total, 
+ROW_NUMBER() OVER(PARTITION BY window_start, window_end ORDER BY total DESC) as rn 
+FROM ( 
+SELECT window_start, window_end,p.id,p.category,
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)))) AS total
+FROM TABLE (TUMBLE(TABLE product, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '-1' HOUR)) as pw 
+JOIN purchase as pr ON pr.product_id = pw.id 
+JOIN product as p ON p.id = pw.id  
+GROUP BY window_start, window_end, p.id, p.category, p.name, p.price, pr.quantity, pr.discount ))
+WHERE rn = 1;
+
+CREATE TABLE sales ( 
+`id` INT, 
+`category` STRING, 
+`window_end` TIMESTAMP(3), 
+`total` DOUBLE,
+`window_start` TIMESTAMP(3),
+`rn` BIGINT, 
+PRIMARY KEY(id) NOT ENFORCED
+) WITH ( 
+'connector' = 'upsert-kafka', 
+'topic' = 'sales', 
+'properties.bootstrap.servers' = 'kafka-1:9092', 
+'properties.security.protocol' = 'SASL_PLAINTEXT',
+'properties.sasl.mechanism' = 'PLAIN',
+'properties.sasl.jaas.config' = 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret";',
+'key.format' = 'avro-confluent',
+'key.avro-confluent.schema-registry.url' = 'http://schema-registry:8085',
+'value.format' = 'avro-confluent',
+'value.avro-confluent.schema-registry.url' = 'http://schema-registry:8085',
+'value.avro-confluent.schema-registry.subject' = 'sales-value',
+'key.avro-confluent.schema-registry.subject' = 'sales-value',
+'properties.auto.offset.reset' = 'earliest'
+); 
+
+INSERT INTO sales (window_start, window_end, id, category, total)
+SELECT * FROM final_table; 
+
+CREATE VIEW table_join AS 
+SELECT p.id, p.category, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount, 0)/100))) AS total 
+FROM product p JOIN purchase pr ON p.id = pr.product_id 
+GROUP BY p.id, p.category; 
+
+INSERT INTO sales 
+SELECT t.id, t.category,t.total, w.window_start, w.window_end FROM table_join t CROSS JOIN top_window w ; 
+
+
+---- Create a window in view ---- 
+CREATE VIEW top_window 
+SELECT window_start, window_end 
+FROM TABLE(TUMBLE(TABLE product, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '-1' HOUR)); 
+IN
+
+--- Combine both the tables --- 
+CREATE VIEW rn_table AS 
+SELECT window_start, window_end, p.id, p.category, 
+SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) AS total, 
+ROW_NUMBER() OVER(PARTITION BY window_start, window_end ORDER BY SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) DESC) AS rn
+FROM TABLE ( 
+TUMBLE(TABLE product, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '-1' HOUR)) AS pw 
+JOIN purchase pr ON pr.product_id = pw.id 
+JOIN product p ON p.id = pw.id 
+GROUP BY window_start, window_end, p.id, p.category;
+
+
+INSERT INTO sales 
+SELECT * FROM final_table order by total DESC; 
+
+
+
+
+
+INSERT INTO sales (id, category, window_end,total, window_start,rn) 
+SELECT p.id, p.category, window_end,
+SUM((p.price * pr.quantity - (1 - pr.discount/100))) AS total,  window_start, 
+ROW_NUMBER() OVER(PARTITION BY window_start, window_end ORDER BY SUM((p.price * pr.quantity - (1 - COALESCE(pr.discount,0)/100))) DESC) AS rn 
+FROM TABLE ( 
+TUMBLE ( TABLE product, DESCRIPTOR(created), INTERVAL '5' MINUTE, INTERVAL '-1' HOUR)) AS pw 
+JOIN purchase pr ON pr.product_id = pw.id 
+JOIN product p ON p.id = pw.id 
+GROUP BY p.id, p.category, window_end, window_start;
+
